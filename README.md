@@ -11,6 +11,7 @@ Continuously mirrors Git repositories from any source to any destination using S
 - **Continuous** — runs in an infinite loop with a configurable sleep interval
 - **Retry mechanism** — network-dependent Git commands are retried up to 3 times with a 5-second delay
 - **JSON config** — repositories defined in a simple JSON file, validated at startup
+- **Large file stripping** — files over 100MB are automatically removed from history before pushing, so destinations with file size limits (e.g. GitHub) just work
 - **Safe directory handling** — all Git operations run in subshells to prevent working-directory corruption
 
 ## Prerequisites
@@ -38,7 +39,8 @@ Continuously mirrors Git repositories from any source to any destination using S
      "repos": [
        {
          "source": "git@bitbucket.org:myorg/my-repo.git",
-         "destination": "git@github.com:myorg/my-repo.git"
+         "destination": "git@github.com:myorg/my-repo.git",
+         "clone_depth": "full"
        }
      ]
    }
@@ -81,7 +83,13 @@ Examples:
   "repos": [
     {
       "source": "git@source-host:org/repo.git",
-      "destination": "git@dest-host:org/repo.git"
+      "destination": "git@dest-host:org/repo.git",
+      "clone_depth": "full"
+    },
+    {
+      "source": "git@source-host:org/another-repo.git",
+      "destination": "git@dest-host:org/another-repo.git",
+      "clone_depth": "shallow"
     }
   ]
 }
@@ -90,15 +98,18 @@ Examples:
 Each object in the `repos` array must have:
 - `source` — SSH URL of the upstream (authoritative) repository
 - `destination` — SSH URL of the mirror (replica) repository
+- `clone_depth` — `"full"` (complete history via `git clone --mirror`) or `"shallow"` (depth 1, latest commit per branch only — much faster)
 
 The config is loaded once at startup. To pick up changes, restart the script.
 
 ## How It Works
 
-1. **Clone** — If a local bare mirror doesn't exist yet, `git clone --mirror <source>` creates one.
-2. **Fetch** — `git fetch -p origin` pulls all updates and prunes deleted remote branches.
-3. **Push** — `git push --mirror <destination>` force-pushes all refs to the destination, making it an exact 1:1 replica of the source.
-4. **Sleep** — Waits `--interval` seconds, then repeats.
+1. **Clone** — Each cycle does a fresh clone from the source. `clone_depth: "shallow"` fetches only the latest commit per branch; `"full"` does a complete `git clone --mirror`.
+2. **Strip large files** — Uses `git filter-branch` to remove any files >100MB from the local clone. The source is never modified.
+3. **Push** — `git push --mirror <destination>` force-pushes all refs. Any branches that exist only on the destination are deleted.
+4. **Cleanup & Sleep** — Waits `--interval` seconds, then repeats from step 1.
+
+> **Note:** For repos with files >100MB, the destination's commit SHAs will differ from the source because the large files are stripped from history. All other content, branches, and tags are preserved.
 
 ## License
 

@@ -2,11 +2,13 @@
   "repos": [
     {
       "source": "git@source-host:org/repo-one.git",
-      "destination": "git@dest-host:org/repo-one.git"
+      "destination": "git@dest-host:org/repo-one.git",
+      "clone_depth": "full"
     },
     {
       "source": "git@source-host:org/repo-two.git",
-      "destination": "git@dest-host:org/repo-two.git"
+      "destination": "git@dest-host:org/repo-two.git",
+      "clone_depth": "shallow"
     }
   ]
 }

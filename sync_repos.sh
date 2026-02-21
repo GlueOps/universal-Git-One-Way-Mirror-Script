@@ -102,63 +102,130 @@ execute_with_retry() {
 # sync_repo
 #
 # Mirrors a single repository from source to destination.
+# Each cycle does a fresh clone, optionally strips files >100MB, and pushes.
+# clone_depth controls whether the full history or only the latest commit is
+# cloned ("full" or "shallow").
+# The source repository is never modified.
 # All git operations run inside a subshell so the working directory of the
 # main script is never affected.
 #
 # Arguments:
 #   $1 - source SSH URL
 #   $2 - destination SSH URL
+#   $3 - clone_depth ("full" or "shallow")
 # =============================================================================
 
 sync_repo() {
   local source_url="$1"
   local dest_url="$2"
+  local clone_depth="$3"
 
-  # ---- Extract repo name from source URL ----
   local repo_name="${source_url##*/}"
-  # Ensure it ends with .git
   [[ "$repo_name" != *.git ]] && repo_name="${repo_name}.git"
 
   local repo_dir="${SYNC_DIR}/${repo_name}"
 
-  log_info "--- Syncing: $repo_name ---"
+  log_info "--- Syncing: $repo_name ($clone_depth) ---"
   log_info "  Source:      $source_url"
   log_info "  Destination: $dest_url"
 
-  # ---- Clone (if first run) ----
-  if [[ ! -d "$repo_dir" ]]; then
-    log_info "  Local mirror not found. Cloning..."
-    if ! execute_with_retry git clone --mirror "$source_url" "$repo_dir"; then
+  # ---- Fresh clone every cycle ----
+  [[ -d "$repo_dir" ]] && rm -rf "$repo_dir"
+
+  if [[ "$clone_depth" == "shallow" ]]; then
+    log_info "  Shallow-cloning from source (depth 1)..."
+    if ! execute_with_retry git clone --bare --depth 1 --no-single-branch --progress "$source_url" "$repo_dir"; then
       log_error "  Clone failed for $source_url — skipping this repo."
-      # Clean up partial clone if it exists
       [[ -d "$repo_dir" ]] && rm -rf "$repo_dir"
       return 1
     fi
-    log_info "  Clone successful."
+  else
+    log_info "  Cloning from source (full history)..."
+    if ! execute_with_retry git clone --mirror --progress "$source_url" "$repo_dir"; then
+      log_error "  Clone failed for $source_url — skipping this repo."
+      [[ -d "$repo_dir" ]] && rm -rf "$repo_dir"
+      return 1
+    fi
   fi
+  log_info "  Clone successful."
 
-  # ---- Fetch & Push (inside a subshell for directory safety) ----
+  # ---- Rewrite + Strip + Push (inside a subshell for directory safety) ----
   (
     cd "$repo_dir" || {
       log_error "  Cannot cd into $repo_dir — skipping."
       exit 1
     }
 
-    # Fetch latest changes and prune deleted branches
-    log_info "  Fetching from origin..."
-    if ! execute_with_retry git fetch -p origin; then
-      log_error "  Fetch failed for $source_url — skipping push."
-      exit 1
+    # Shallow clones contain a 'shallow' graft file that --mirror can't push.
+    # Convert grafted commits into true root commits so --mirror works.
+    if [[ -f shallow ]]; then
+      log_info "  Converting shallow commits to root commits..."
+      FILTER_BRANCH_SQUELCH_WARNING=1 \
+        git filter-branch --force --parent-filter 'true' -- --all
+      git for-each-ref --format='delete %(refname)' refs/original | git update-ref --stdin 2>/dev/null
+      rm -f shallow
+      log_info "  Shallow conversion complete."
     fi
-    log_info "  Fetch successful."
+
+    # Strip files >100MB from history (local clone only — source is never touched)
+    log_info "  Scanning for files >100MB..."
+    local large_files_list
+    large_files_list=$(mktemp)
+
+    git rev-list --all --objects | \
+      git cat-file --batch-check='%(objectsize) %(objecttype) %(rest)' | \
+      awk '$2 == "blob" && $1 > 104857600 {$1=""; $2=""; sub(/^  /, ""); print}' | \
+      sort -u > "$large_files_list"
+
+    if [[ -s "$large_files_list" ]]; then
+      local file_count
+      file_count=$(wc -l < "$large_files_list")
+      log_warn "  Found $file_count file(s) >100MB — stripping from history:"
+      while IFS= read -r f; do log_warn "    - $f"; done < "$large_files_list"
+
+      local paths
+      paths=$(tr '\n' ' ' < "$large_files_list")
+
+      FILTER_BRANCH_SQUELCH_WARNING=1 \
+        git filter-branch --force --index-filter \
+          "git rm --cached --ignore-unmatch -- $paths" \
+          -- --all
+
+      # Clean up backup refs and loose objects
+      git for-each-ref --format='delete %(refname)' refs/original | git update-ref --stdin 2>/dev/null
+      rm -f "$large_files_list"
+      log_info "  Large files stripped successfully."
+    else
+      log_info "  No files >100MB found."
+      rm -f "$large_files_list"
+    fi
+
+    # Clean up loose objects after any rewrites
+    git reflog expire --expire=now --all 2>/dev/null
+    git gc --prune=now 2>/dev/null
 
     # Push mirror to destination
     log_info "  Pushing to destination..."
-    if ! execute_with_retry git push --mirror "$dest_url"; then
-      log_error "  Push failed for $dest_url."
-      exit 1
-    fi
-    log_info "  Push successful."
+    local push_rc=0
+    local attempt
+    for attempt in 1 2 3; do
+      push_rc=0
+      git push --mirror --progress --verbose "$dest_url" 2>&1 || push_rc=$?
+
+      if (( push_rc == 0 )); then
+        log_info "  Push successful."
+        break
+      fi
+
+      log_error "  Push failed (attempt $attempt/3, exit $push_rc) for $dest_url."
+      if (( attempt < 3 )); then
+        log_warn "  Retrying in ${RETRY_DELAY}s..."
+        sleep "$RETRY_DELAY"
+      else
+        log_error "  Push failed after 3 attempts."
+        exit 1
+      fi
+    done
   )
 
   local subshell_rc=$?
@@ -221,14 +288,20 @@ main() {
   fi
 
   # Pre-load all mappings into arrays
-  local -a sources=() destinations=()
+  local -a sources=() destinations=() clone_depths=()
   for (( i=0; i<repo_count; i++ )); do
-    local src dst
+    local src dst depth
     src=$(jq -r ".repos[$i].source" "$REPOS_CONFIG")
     dst=$(jq -r ".repos[$i].destination" "$REPOS_CONFIG")
+    depth=$(jq -r ".repos[$i].clone_depth" "$REPOS_CONFIG")
 
     if [[ -z "$src" || "$src" == "null" || -z "$dst" || "$dst" == "null" ]]; then
       echo "ERROR: Invalid mapping at index $i (source and destination must be non-empty)." >&2
+      exit 1
+    fi
+
+    if [[ "$depth" != "full" && "$depth" != "shallow" ]]; then
+      echo "ERROR: Invalid clone_depth at index $i: '$depth' (must be 'full' or 'shallow')." >&2
       exit 1
     fi
 
@@ -239,6 +312,7 @@ main() {
 
     sources+=("$src")
     destinations+=("$dst")
+    clone_depths+=("$depth")
   done
 
   log_info "=========================================="
@@ -263,7 +337,7 @@ main() {
     local succeeded=0
 
     for (( i=0; i<repo_count; i++ )); do
-      if sync_repo "${sources[$i]}" "${destinations[$i]}"; then
+      if sync_repo "${sources[$i]}" "${destinations[$i]}" "${clone_depths[$i]}"; then
         (( succeeded++ ))
       else
         (( failed++ ))
